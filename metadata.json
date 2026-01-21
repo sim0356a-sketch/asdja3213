@@ -1,0 +1,8 @@
+{
+  "name": "SkazkaAI - Premium Fairy Tales",
+  "description": "High-end AI platform for creating personalized stories for children in dark mode style.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
