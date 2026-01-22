@@ -1171,13 +1171,20 @@ app.post('/api/generate/image', async (req, res) => {
 // ПОЛЬЗОВАТЕЛИ И СКАЗКИ
 // =========================================================
 
-function buildUserPayload(u, existingData, savedPhotos) {
+function buildUserPayload(u, existingData, savedPhotos, options = {}) {
+  const {
+    allowCredits = false,
+    allowTier = false,
+    defaultCredits = 3,
+    defaultTier = 'FREE'
+  } = options;
   const id = String(u.id);
   const name = String(u.name || 'Герой');
   const childName = String(u.childName || u.child_name || '');
   const parsedCredits = Number.parseInt(u.credits, 10);
-  const credits = Number.isNaN(parsedCredits) ? 3 : parsedCredits;
-  const tier = String(u.tier || 'FREE');
+  const safeCredits = Number.isNaN(parsedCredits) ? defaultCredits : parsedCredits;
+  const credits = allowCredits ? safeCredits : (existingData.credits ?? defaultCredits);
+  const tier = allowTier ? String(u.tier || defaultTier) : String(existingData.tier || defaultTier);
   const existingPhotos = existingData.childPhotos || [];
   const allPhotos = [...existingPhotos, ...savedPhotos];
 
@@ -1230,7 +1237,7 @@ app.post('/api/users/create', upload.array('photos'), async (req, res) => {
     }
 
     const savedPhotos = (req.files || []).map(file => file.path);
-    const payload = buildUserPayload(u, {}, savedPhotos);
+    const payload = buildUserPayload(u, {}, savedPhotos, { defaultCredits: 3, defaultTier: 'FREE' });
 
     await pool.query(`
       INSERT INTO users (id, name, child_name, credits, tier, data)
@@ -1269,7 +1276,7 @@ app.put('/api/users/:id', upload.array('photos'), async (req, res) => {
     }
 
     const savedPhotos = (req.files || []).map(file => file.path);
-    const payload = buildUserPayload(u, existingData, savedPhotos);
+    const payload = buildUserPayload(u, existingData, savedPhotos, { defaultCredits: 3, defaultTier: 'FREE' });
 
     await pool.query(`
       UPDATE users
