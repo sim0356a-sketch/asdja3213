@@ -869,16 +869,21 @@ async function generateImageWithGPTImage1({ prompt, style, requestId, userId }) 
       model: 'gpt-image-1',
       prompt: `Children book illustration, ${style || 'cartoon style'}. ${prompt}`,
       size: '1024x1024',
-      quality: 'standard',
-      n: 1
+      quality: 'auto',
+      n: 1,
+      response_format: 'b64_json'
     }, { signal: controller.signal });
 
     clearTimeout(timeout);
 
-    const imageUrl = result.data[0]?.url;
-    
+    const imageData = result?.data?.[0];
+    const base64Image = imageData?.b64_json;
+    const imageUrl = base64Image
+      ? `data:image/png;base64,${base64Image}`
+      : imageData?.url;
+
     if (!imageUrl) {
-      throw new Error('No image URL in response from GPT-Image-1');
+      throw new Error('No image data in response from GPT-Image-1');
     }
     
     logToFile('success', `[${requestId}] Изображение сгенерировано GPT-Image-1`, { 
