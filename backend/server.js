@@ -6,6 +6,7 @@ import mysql from 'mysql2/promise';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import fs from 'fs';
+import crypto from 'crypto';
 import multer from 'multer';
 import * as z from "zod";
 import {zodResponseFormat} from "openai/helpers/zod";
@@ -499,6 +500,25 @@ async function testProxyConnection(requestId) {
   };
 }
 
+async function getUserRecord(userId) {
+  const [rows] = await pool.query('SELECT * FROM users WHERE id=?', [userId]);
+  if (!rows.length) {
+    return null;
+  }
+
+  const user = rows[0];
+  let extraData = {};
+  if (user.data) {
+    try {
+      extraData = typeof user.data === 'string' ? JSON.parse(user.data) : user.data;
+    } catch (e) {
+      logToFile('error', 'Ошибка парсинга данных пользователя', e);
+    }
+  }
+
+  return { user, extraData };
+}
+
 // =========================================================
 // ЭНДПОИНТЫ ДЛЯ ДИАГНОСТИКИ
 // =========================================================
@@ -712,8 +732,40 @@ const upload = multer({
   }
 });
 
+function saveBase64Image(dataUrl, userId, filename) {
+  if (!dataUrl) return '';
+  if (typeof dataUrl !== 'string') return '';
+  if (dataUrl.startsWith('http://') || dataUrl.startsWith('https://')) {
+    return dataUrl;
+  }
+  if (!dataUrl.startsWith('data:')) {
+    return dataUrl;
+  }
+
+  const match = dataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+  if (!match) {
+    return dataUrl;
+  }
+
+  const mime = match[1];
+  const ext = mime.split('/')[1] || 'png';
+  const buffer = Buffer.from(match[2], 'base64');
+  const uploadDir = path.join(process.cwd(), 'uploads');
+
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+
+  const safeUserId = String(userId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '');
+  const fileName = `${safeUserId}_${filename}.${ext}`;
+  const filePath = path.join(uploadDir, fileName);
+
+  fs.writeFileSync(filePath, buffer);
+  return `/uploads/${fileName}`;
+}
+
 // =========================================================
-// ГЕНЕРАЦИЯ ИСТОРИИ С GPT-4.1-MINI
+// ГЕНЕРАЦИЯ ИСТОРИИ С GPT-5-MINI
 // =========================================================
 
 const Page = z.object({
@@ -938,7 +990,7 @@ app.get('/api/test', (req, res) => {
     },
     openai: {
       clientReady: !!openaiClient,
-      textModel: 'gpt-4.1-mini',
+      textModel: 'gpt-5-mini',
       imageModel: 'gpt-image-1'
     }
   });
@@ -1017,7 +1069,7 @@ app.post('/api/generate/story', async (req, res) => {
   const { params, userId } = req.body;
   const requestId = req.requestId;
 
-  logToFile('info', `[${requestId}] Генерация сказки GPT-4.1-mini`, { userId });
+  logToFile('info', `[${requestId}] Генерация сказки GPT-5-mini`, { userId });
 
   if (!params || !userId) {
     return res.status(400).json({
@@ -1044,7 +1096,7 @@ app.post('/api/generate/story', async (req, res) => {
   } catch (error) {
     const isTimeout = error.name === 'AbortError' || error.message?.includes('timeout');
     
-    logToFile('error', `[${requestId}] Ошибка генерации GPT-4.1-mini`, error);
+    logToFile('error', `[${requestId}] Ошибка генерации GPT-5-mini`, error);
     
     // 🔴 FALLBACK: Если не удалось, возвращаем тестовую сказку
     const fallbackStory = {
@@ -1056,7 +1108,7 @@ app.post('/api/generate/story', async (req, res) => {
       fallback: true,
       requestId,
       model: 'fallback',
-      error: isTimeout ? 'GPT-4.1-mini timeout' : 'GPT-4.1-mini error'
+      error: isTimeout ? 'GPT-5-mini timeout' : 'GPT-5-mini error'
     };
     
     res.json(fallbackStory);
@@ -1119,73 +1171,121 @@ app.post('/api/generate/image', async (req, res) => {
 // ПОЛЬЗОВАТЕЛИ И СКАЗКИ
 // =========================================================
 
-app.post('/api/user', upload.array('photos'), async (req, res) => {
-  const requestId = req.requestId;
-  
-  try {
-    const u = req.body;
+function buildUserPayload(u, existingData, savedPhotos) {
+  const id = String(u.id);
+  const name = String(u.name || 'Герой');
+  const childName = String(u.childName || u.child_name || '');
+  const parsedCredits = Number.parseInt(u.credits, 10);
+  const credits = Number.isNaN(parsedCredits) ? 3 : parsedCredits;
+  const tier = String(u.tier || 'FREE');
+  const existingPhotos = existingData.childPhotos || [];
+  const allPhotos = [...existingPhotos, ...savedPhotos];
 
-    if (!u.id) {
-      return res.status(400).json({ error: 'No ID provided', requestId });
+  const data = JSON.stringify({
+    ...existingData,
+    name: name,
+    childName: childName,
+    childPhotos: allPhotos,
+    credits: credits,
+    tier: tier,
+    lastUpdated: new Date().toISOString()
+  });
+
+  return { id, name, childName, credits, tier, data };
+}
+
+async function loadUserData(userId) {
+  const [existingRows] = await pool.query('SELECT data FROM users WHERE id=?', [userId]);
+  if (!existingRows.length) {
+    return { exists: false, data: {} };
+  }
+
+  let existingData = {};
+  try {
+    existingData = JSON.parse(existingRows[0].data || '{}');
+  } catch (parseError) {
+    logToFile('error', 'Ошибка парсинга данных пользователя', parseError);
+  }
+
+  return { exists: true, data: existingData };
+}
+
+app.post('/api/users/create', upload.array('photos'), async (req, res) => {
+  const requestId = req.requestId;
+  const u = req.body;
+
+  if (!u.id) {
+    return res.status(400).json({ error: 'No ID provided', requestId });
+  }
+
+  if (!pool) {
+    logToFile('warn', 'База данных не доступна, сохраняем только файлы');
+    return res.status(503).json({ error: 'Database unavailable', requestId });
+  }
+
+  try {
+    const { exists } = await loadUserData(u.id);
+    if (exists) {
+      return res.status(409).json({ error: 'User already exists', requestId });
     }
 
     const savedPhotos = (req.files || []).map(file => file.path);
+    const payload = buildUserPayload(u, {}, savedPhotos);
 
-    const id = String(u.id);
-    const name = String(u.name || 'Герой');
-    const childName = String(u.childName || u.child_name || '');
-    const credits = parseInt(u.credits) || 3;
-    const tier = String(u.tier || 'FREE');
+    await pool.query(`
+      INSERT INTO users (id, name, child_name, credits, tier, data)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [payload.id, payload.name, payload.childName, payload.credits, payload.tier, payload.data]);
 
-    if (pool) {
-      const [existingRows] = await pool.query('SELECT data FROM users WHERE id=?', [id]);
-      let existingData = {};
-      
-      if (existingRows.length) {
-        try {
-          existingData = JSON.parse(existingRows[0].data || '{}');
-        } catch (parseError) {
-          logToFile('error', 'Ошибка парсинга данных пользователя', parseError);
-        }
-      }
-
-      const existingPhotos = existingData.childPhotos || [];
-      const allPhotos = [...existingPhotos, ...savedPhotos];
-
-      const data = JSON.stringify({
-        ...existingData,
-        name: name,
-        childName: childName,
-        childPhotos: allPhotos,
-        credits: credits,
-        tier: tier,
-        lastUpdated: new Date().toISOString()
-      });
-
-      await pool.query(`
-        INSERT INTO users (id, name, child_name, credits, tier, data)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON DUPLICATE KEY UPDATE
-          name = VALUES(name),
-          child_name = VALUES(child_name),
-          credits = VALUES(credits),
-          tier = VALUES(tier),
-          data = VALUES(data)
-      `, [id, name, childName, credits, tier, data]);
-    } else {
-      logToFile('warn', 'База данных не доступна, сохраняем только файлы');
-    }
-
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
       photos: savedPhotos,
       requestId,
-      dbAvailable: !!pool
+      dbAvailable: true
     });
-    
   } catch (e) {
-    logToFile('error', `[${requestId}] User Save Error:`, e);
-    res.status(500).json({ error: 'Save failed', requestId });
+    logToFile('error', `[${requestId}] User Create Error:`, e);
+    res.status(500).json({ error: 'Create failed', requestId });
+  }
+});
+
+app.put('/api/users/:id', upload.array('photos'), async (req, res) => {
+  const requestId = req.requestId;
+  const u = { ...req.body, id: req.params.id };
+
+  if (!u.id) {
+    return res.status(400).json({ error: 'No ID provided', requestId });
+  }
+
+  if (!pool) {
+    logToFile('warn', 'База данных не доступна, сохраняем только файлы');
+    return res.status(503).json({ error: 'Database unavailable', requestId });
+  }
+
+  try {
+    const { exists, data: existingData } = await loadUserData(u.id);
+    if (!exists) {
+      return res.status(404).json({ error: 'User not found', requestId });
+    }
+
+    const savedPhotos = (req.files || []).map(file => file.path);
+    const payload = buildUserPayload(u, existingData, savedPhotos);
+
+    await pool.query(`
+      UPDATE users
+      SET name = ?, child_name = ?, credits = ?, tier = ?, data = ?
+      WHERE id = ?
+    `, [payload.name, payload.childName, payload.credits, payload.tier, payload.data, payload.id]);
+
+    res.json({
+      success: true,
+      photos: savedPhotos,
+      requestId,
+      dbAvailable: true
+    });
+  } catch (e) {
+    logToFile('error', `[${requestId}] User Update Error:`, e);
+    res.status(500).json({ error: 'Update failed', requestId });
   }
 });
 
@@ -1253,8 +1353,41 @@ app.get('/api/user/:id', async (req, res) => {
 // Сказки
 // =========================================================
 
+async function loadTaleExists(taleId) {
+  const [rows] = await pool.query('SELECT id FROM tales WHERE id = ?', [taleId]);
+  return rows.length > 0;
+}
+
+function prepareTaleForSave(tale, userId) {
+  const processedPages = tale.pages?.map((p, i) => ({
+    ...p,
+    imageUrl: saveBase64Image(p.imageUrl, userId, `page_${tale.id}_${i}`)
+  })) || [];
+
+  return { ...tale, pages: processedPages };
+}
+
+async function updateUserCredits(userId, existingData, credits, tier) {
+  const data = JSON.stringify({
+    ...existingData,
+    credits,
+    tier,
+    lastUpdated: new Date().toISOString()
+  });
+
+  await pool.query(
+    'UPDATE users SET credits = ?, tier = ?, data = ? WHERE id = ?',
+    [credits, tier, data, userId]
+  );
+}
+
 app.get('/api/tales/:userId', async (req, res) => {
   try {
+    if (!pool) {
+      logToFile('warn', 'Database unavailable for get tales', { userId: req.params.userId });
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
+
     const [rows] = await pool.query('SELECT * FROM tales WHERE user_id = ? ORDER BY created_at DESC', [req.params.userId]);
     res.json(rows.map(r => ({ ...JSON.parse(r.data), id: r.id, createdAt: r.created_at })));
   } catch (e) {
@@ -1263,24 +1396,151 @@ app.get('/api/tales/:userId', async (req, res) => {
   }
 });
 
-app.post('/api/tales/save', async (req, res) => {
+app.post('/api/tales', async (req, res) => {
   const { userId, tale } = req.body;
   try {
-    const processedPages = tale.pages?.map((p, i) => ({
-      ...p,
-      imageUrl: saveBase64Image(p.imageUrl, userId, `page_${tale.id}_${i}`)
-    })) || [];
+    if (!pool) {
+      logToFile('warn', 'Database unavailable for create tale', { userId, taleId: tale?.id });
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
 
-    const updatedTale = { ...tale, pages: processedPages };
+    if (!userId || !tale?.id) {
+      return res.status(400).json({ error: 'Missing userId or tale', requestId: req.requestId });
+    }
 
-    await pool.query(`INSERT INTO tales (id, user_id, title, status, data) 
-      VALUES (?,?,?,?,?) ON DUPLICATE KEY UPDATE title=VALUES(title), status=VALUES(status), data=VALUES(data)`,
-      [tale.id, userId, tale.title, tale.status, JSON.stringify(updatedTale)]);
+    const exists = await loadTaleExists(tale.id);
+    if (exists) {
+      return res.status(409).json({ error: 'Tale already exists', requestId: req.requestId });
+    }
 
-    console.info('Tale saved/updated', `TaleID: ${tale.id}, User: ${userId}, Status: ${tale.status}`);
+    const updatedTale = prepareTaleForSave(tale, userId);
+    await pool.query(
+      'INSERT INTO tales (id, user_id, title, status, data) VALUES (?,?,?,?,?)',
+      [updatedTale.id, userId, updatedTale.title, updatedTale.status, JSON.stringify(updatedTale)]
+    );
+
+    console.info('Tale created', `TaleID: ${tale.id}, User: ${userId}, Status: ${tale.status}`);
     res.json({ success: true });
   } catch (e) {
-    console.error(`Failed to save tale ${tale.id} for user ${userId}`, e.message);
+    console.error(`Failed to create tale ${tale?.id} for user ${userId}`, e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/tales/generate', async (req, res) => {
+  const { userId, params } = req.body;
+  const requestId = req.requestId;
+
+  try {
+    if (!pool) {
+      logToFile('warn', 'Database unavailable for generate tale', { userId });
+      return res.status(503).json({ error: 'Database unavailable', requestId });
+    }
+
+    if (!openaiClient) {
+      return res.status(500).json({ error: 'OpenAI client not initialized', requestId });
+    }
+
+    if (!userId || !params?.theme) {
+      return res.status(400).json({ error: 'Missing userId or params', requestId });
+    }
+
+    const userRecord = await getUserRecord(userId);
+    if (!userRecord) {
+      return res.status(404).json({ error: 'User not found', requestId });
+    }
+
+    const { user, extraData } = userRecord;
+    const tier = user.tier || extraData.tier || 'FREE';
+    const currentCredits = user.credits !== undefined ? user.credits : (extraData.credits ?? 0);
+
+    if (tier !== 'PREMIUM' && currentCredits <= 0) {
+      return res.status(402).json({ error: 'Not enough credits', requestId });
+    }
+
+    const story = await generateStoryWithGPT41({ params, requestId });
+    const style = params.style || 'cartoon style';
+
+    const pages = [];
+    for (const [index, page] of (story.pages || []).entries()) {
+      try {
+        const imageResult = await generateImageWithGPTImage1({
+          prompt: page.imagePrompt,
+          style,
+          requestId,
+          userId
+        });
+        pages.push({ text: page.text, imageUrl: imageResult.imageUrl });
+      } catch (imageError) {
+        logToFile('error', `[${requestId}] Ошибка генерации изображения`, imageError);
+        pages.push({ text: page.text, imageUrl: '' });
+      }
+    }
+
+    const taleId = crypto.randomUUID();
+    const tale = {
+      id: taleId,
+      title: story.title || `Сказка для ${params.childName || 'героя'}`,
+      pages,
+      status: 'ready',
+      createdAt: Date.now(),
+      childName: params.childName || '',
+      heroPhoto: params.heroPhoto || '',
+      hook: params.hook || ''
+    };
+
+    const updatedTale = prepareTaleForSave(tale, userId);
+
+    await pool.query(
+      'INSERT INTO tales (id, user_id, title, status, data) VALUES (?,?,?,?,?)',
+      [updatedTale.id, userId, updatedTale.title, updatedTale.status, JSON.stringify(updatedTale)]
+    );
+
+    if (tier !== 'PREMIUM') {
+      const nextCredits = Math.max(0, currentCredits - 1);
+      await updateUserCredits(userId, extraData, nextCredits, tier);
+    }
+
+    res.json({
+      success: true,
+      tale: updatedTale,
+      credits: tier === 'PREMIUM' ? currentCredits : currentCredits - 1,
+      requestId
+    });
+  } catch (e) {
+    logToFile('error', `[${requestId}] Ошибка генерации сказки`, e);
+    res.status(500).json({ error: 'Generate failed', requestId });
+  }
+});
+
+app.put('/api/tales/:id', async (req, res) => {
+  const { userId, tale } = req.body;
+  const taleId = req.params.id;
+  try {
+    if (!pool) {
+      logToFile('warn', 'Database unavailable for update tale', { userId, taleId });
+      return res.status(503).json({ error: 'Database unavailable' });
+    }
+
+    if (!userId || !tale?.id || taleId !== tale.id) {
+      return res.status(400).json({ error: 'Missing userId or tale', requestId: req.requestId });
+    }
+
+    const exists = await loadTaleExists(taleId);
+    if (!exists) {
+      return res.status(404).json({ error: 'Tale not found', requestId: req.requestId });
+    }
+
+    const updatedTale = prepareTaleForSave(tale, userId);
+    await pool.query(
+      'UPDATE tales SET title = ?, status = ?, data = ? WHERE id = ? AND user_id = ?',
+      [updatedTale.title, updatedTale.status, JSON.stringify(updatedTale), taleId, userId]
+    );
+
+    console.info('Tale updated', `TaleID: ${tale.id}, User: ${userId}, Status: ${tale.status}`);
+    res.json({ success: true });
+  } catch (e) {
+    console.error(`Failed to update tale ${taleId} for user ${userId}`, e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1339,7 +1599,7 @@ async function startServer() {
       console.log(`🔗 API URL: ${API_URL}`);
       console.log(`📊 Внутренний порт: ${PORT} (IP: ${listenIP})`);
       console.log(`🔐 HTTPS: Включен через Apache`);
-      console.log(`🤖 Текст: gpt-4.1-mini`);
+      console.log(`🤖 Текст: gpt-5-mini`);
       console.log(`🎨 Изображения: gpt-image-1`);
       console.log(`📁 Логи: ${logFile}`);
       console.log('='.repeat(50));

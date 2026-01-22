@@ -115,6 +115,32 @@ async function enhancedFetch(url: string, options?: RequestInit, retries = 3): P
   throw new Error(`Не удалось выполнить запрос после ${retries} попыток`);
 }
 
+function buildUserFormData(user: User): FormData {
+  const formData = new FormData();
+  formData.append('id', user.id);
+  formData.append('name', user.name);
+  formData.append('childName', user.childName);
+  formData.append('credits', user.credits.toString());
+  formData.append('tier', user.tier || 'FREE');
+
+  let newPhotoCount = 0;
+  user.childPhotos?.forEach((photo) => {
+    if (photo.startsWith('data:')) {
+      try {
+        const blob = dataURLtoBlob(photo);
+        if (blob.size > 0) {
+          formData.append('photos', blob, `photo_${newPhotoCount}.png`);
+          newPhotoCount += 1;
+        }
+      } catch (e) {
+        console.error('Ошибка конвертации фото:', e);
+      }
+    }
+  });
+
+  return formData;
+}
+
 export const ApiService = {
   async getUser(id: string): Promise<User | null> {
     try {
@@ -167,40 +193,13 @@ export const ApiService = {
     }
   },
 
-  async saveUser(user: User): Promise<boolean> {
+  async createUser(user: User): Promise<boolean> {
     try {
-      localStorage.setItem('skaz_user_id', user.id);
+      localStorage.setItem('skazka_user_id', user.id);
 
-      // Создаем FormData для файлов
-      const formData = new FormData();
-      formData.append('id', user.id);
-      formData.append('name', user.name);
-      formData.append('childName', user.childName);
-      formData.append('credits', user.credits.toString());
-      formData.append('tier', user.tier || 'FREE');
+      const formData = buildUserFormData(user);
 
-      // 🔴 ВАЖНО: Отправляем только НОВЫЕ фото (те что base64)
-      // Существующие фото (URLs) не отправляем повторно
-      let newPhotoCount = 0;
-      
-      user.childPhotos?.forEach((photo, i) => {
-        // Отправляем только base64 фото (новые)
-        if (photo.startsWith('data:')) {
-          try {
-            const blob = dataURLtoBlob(photo);
-            if (blob.size > 0) {
-              formData.append('photos', blob, `photo_${newPhotoCount}.png`);
-              newPhotoCount++;
-            }
-          } catch (e) {
-            console.error('Ошибка конвертации фото:', e);
-          }
-        }
-      });
-      
-      console.log(`📸 Сохранение пользователя: ${newPhotoCount} новых фото`);
-
-      const res = await enhancedFetch('/user', {
+      const res = await enhancedFetch('/users/create', {
         method: 'POST',
         body: formData
         // 🔴 НЕ добавляем Content-Type для FormData - браузер сам установит
@@ -214,22 +213,80 @@ export const ApiService = {
       
       return true;
     } catch (e) {
-      console.error('SaveUser Failure:', e);
+      console.error('CreateUser Failure:', e);
       return false;
     }
   },
 
-  async saveTale(userId: string, tale: Tale): Promise<void> {
+  async updateUser(user: User): Promise<boolean> {
     try {
-      await enhancedFetch('/tales/save', {
+      localStorage.setItem('skazka_user_id', user.id);
+
+      const formData = buildUserFormData(user);
+      const res = await enhancedFetch(`/users/${user.id}`, {
+        method: 'PUT',
+        body: formData
+      });
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        console.error('UpdateUser Server Error:', err);
+        throw new Error(err.error || 'Server rejected update');
+      }
+
+      return true;
+    } catch (e) {
+      console.error('UpdateUser Failure:', e);
+      return false;
+    }
+  },
+
+  async createTale(userId: string, tale: Tale): Promise<void> {
+    try {
+      await enhancedFetch('/tales', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, tale })
       });
       
-      console.log('✅ Сказка сохранена:', tale.id);
+      console.log('✅ Сказка создана:', tale.id);
     } catch (e) {
-      console.error('SaveTale Error:', e);
+      console.error('CreateTale Error:', e);
+    }
+  },
+
+  async generateTale(params: any, userId: string): Promise<{ tale: Tale; credits?: number } | null> {
+    try {
+      const res = await enhancedFetch('/tales/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, params })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+        throw new Error(err.error || 'Generate failed');
+      }
+
+      const data = await res.json();
+      return { tale: data.tale, credits: data.credits };
+    } catch (error) {
+      console.error('GenerateTale Error:', error);
+      return null;
+    }
+  },
+
+  async updateTale(userId: string, tale: Tale): Promise<void> {
+    try {
+      await enhancedFetch(`/tales/${tale.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId, tale })
+      });
+      
+      console.log('✅ Сказка обновлена:', tale.id);
+    } catch (e) {
+      console.error('UpdateTale Error:', e);
     }
   },
 
