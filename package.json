@@ -3,11 +3,11 @@
   "version": "1.0.0",
   "description": "AI Fairy Tales Platform",
   "type": "module",
-  "main": "app.js",
+  "main": "backend/server.js",
   "scripts": {
-    "start": "node app.js",
-    "build": "vite build",
-    "dev": "vite"
+    "start": "node backend/server.js",
+    "build": "vite build --config vite.config.ts",
+    "dev": "vite --config vite.config.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",

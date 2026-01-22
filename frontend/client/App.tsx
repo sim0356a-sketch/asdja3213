@@ -1,8 +1,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
-import { User, Tale, TalePage, UserTier } from './types.ts';
+import { User, Tale, UserTier } from './types.ts';
 import { ApiService } from './services/api.ts';
-import { GeminiService } from './services/gemini.ts';
 import Layout from './components/Layout.tsx';
 import Library from './components/Library.tsx';
 import CreationFunnel from './components/CreationFunnel.tsx';
@@ -108,15 +107,39 @@ const App: React.FC = () => {
     setCurrentView('library');
     showToast("Магия началась! 🦄");
 
-    // Запуск фоновой генерации через API (логика в server.js)
+    // Запуск генерации через API
     try {
-        const res = await fetch('/api/tales/save', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ userId: user.id, tale: tempTale })
-        });
-        // Здесь можно добавить опрос статуса, если реализовано на бэкенде
-    } catch (e) { console.error(e); }
+      const result = await ApiService.generateTale({
+        childName: user.childName,
+        theme: params.theme,
+        hook: params.hook || '',
+        style: params.style,
+        extraCharacters: params.selectedCharIds || [],
+        heroPhoto: user.childPhotos[0]
+      }, user.id);
+
+      if (!result?.tale) {
+        throw new Error('No tale generated');
+      }
+
+      const finalTale: Tale = {
+        ...tempTale,
+        ...result.tale,
+        status: 'ready',
+        progress: 100
+      };
+
+      setTales(prev => prev.map(tale => (tale.id === tempId ? finalTale : tale)));
+      if (result.credits !== undefined) {
+        setUser(prev => (prev ? { ...prev, credits: result.credits } : prev));
+      }
+    } catch (e) {
+      console.error('Story generation failed:', e);
+      setTales(prev => prev.map(tale => (
+        tale.id === tempId ? { ...tale, status: 'error' } : tale
+      )));
+      showToast("Не удалось создать сказку. Попробуйте еще раз.", "error");
+    }
   };
 
   const handleNavigate = (view: string) => {
@@ -186,7 +209,7 @@ const App: React.FC = () => {
           onUpdateUser={(u) => {
             const updated = { ...user, ...u };
             setUser(updated);
-            ApiService.saveUser(updated);
+            ApiService.updateUser(updated);
           }} 
           isMiniApp={isTG} 
           onNavigate={handleNavigate} 
@@ -214,7 +237,7 @@ const App: React.FC = () => {
               ...data
             } as User;
             setUser(newUser);
-            ApiService.saveUser(newUser);
+            ApiService.createUser(newUser);
             setCurrentView('library');
             showToast("Приятно познакомиться! ✨");
           }} 
