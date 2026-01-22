@@ -261,7 +261,7 @@ export const ApiService = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, params })
-      });
+      }, 1);
 
       if (!res.ok) {
         const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
@@ -313,7 +313,7 @@ export const ApiService = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ params, userId })
-      });
+      }, 1);
       
       if (!res.ok) {
         throw new Error(`Генерация не удалась: ${res.status}`);
@@ -332,7 +332,7 @@ export const ApiService = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt, style, userId })
-      });
+      }, 1);
       
       if (!res.ok) {
         throw new Error(`Генерация изображения не удалась: ${res.status}`);
